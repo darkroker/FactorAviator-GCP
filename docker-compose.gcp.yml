@@ -1,0 +1,255 @@
+# 🐳 Docker Compose para GCP - Aviator Trading System
+# Configuración optimizada para Cloud Run, Compute Engine y Kubernetes
+
+version: '3.8'
+
+services:
+  # Aplicación principal Aviator
+  aviator-app:
+    build:
+      context: .
+      dockerfile: Dockerfile.gcp
+    image: gcr.io/${GCP_PROJECT_ID}/aviator-app:${VERSION:-latest}
+    container_name: aviator-app
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - NODE_ENV=${ENVIRONMENT:-production}
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID}
+      - GCP_REGION=${GCP_REGION:-us-central1}
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=${DATABASE_URL}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/gcp-credentials.json
+      - PORT=8080
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    volumes:
+      - ./gcp/credentials:/app/credentials:ro
+      - app-logs:/app/logs
+    depends_on:
+      - redis
+    networks:
+      - aviator-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "gcplogs"
+      options:
+        gcp-project: "${GCP_PROJECT_ID}"
+        gcp-log-driver: "gcplogs"
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+
+  # Redis para caché y sesiones
+  redis:
+    image: redis:7-alpine
+    container_name: aviator-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+      - ./gcp/config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    networks:
+      - aviator-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "gcplogs"
+      options:
+        gcp-project: "${GCP_PROJECT_ID}"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  # Nginx como reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: aviator-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./gcp/config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./gcp/ssl:/etc/nginx/ssl:ro
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      - aviator-app
+    networks:
+      - aviator-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "gcplogs"
+      options:
+        gcp-project: "${GCP_PROJECT_ID}"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+
+  # Prometheus para métricas
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: aviator-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./gcp/config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - aviator-network
+    logging:
+      driver: "gcplogs"
+      options:
+        gcp-project: "${GCP_PROJECT_ID}"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  # Grafana para visualización
+  grafana:
+    image: grafana/grafana:latest
+    container_name: aviator-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_DOMAIN=${DOMAIN_NAME}
+      - GF_SMTP_ENABLED=true
+      - GF_SMTP_HOST=${SMTP_HOST}
+      - GF_SMTP_USER=${SMTP_USER}
+      - GF_SMTP_PASSWORD=${SMTP_PASSWORD}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./gcp/config/grafana:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - aviator-network
+    logging:
+      driver: "gcplogs"
+      options:
+        gcp-project: "${GCP_PROJECT_ID}"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+# Volúmenes persistentes
+volumes:
+  redis-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/aviator/data/redis
+  
+  prometheus-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/aviator/data/prometheus
+  
+  grafana-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/aviator/data/grafana
+  
+  app-logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/aviator/logs
+  
+  nginx-logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/aviator/logs/nginx
+
+# Configuración de red
+networks:
+  aviator-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+    driver_opts:
+      com.docker.network.bridge.name: aviator-br0
+
+# Configuración para Docker Swarm (opcional)
+configs:
+  nginx_config:
+    file: ./gcp/config/nginx.conf
+  prometheus_config:
+    file: ./gcp/config/prometheus.yml
+  redis_config:
+    file: ./gcp/config/redis.conf
+
+secrets:
+  gcp_credentials:
+    file: ./gcp/credentials/aviator-gcp-credentials.json
+  redis_password:
+    external: true
+  grafana_password:
+    external: true
+  database_url:
+    external: true
